@@ -8,6 +8,7 @@ import requests
 import urllib3
 import urllib.parse
 from web import Request
+from prance import ResolvingParser
 
 AUTOFILL_VALUES = {
     "file": ("pix.gif", b"GIF89a", "image/gif"),
@@ -29,6 +30,8 @@ def get_base_url(swaggerFile, url):
                 swaggerFile['host'] = urllib.parse.urlparse(url).hostname
             else:
                 swaggerFile['host'] = ""
+        elif swaggerFile['host'] == "localhost" and url:
+            swaggerFile['host'] = urllib.parse.urlparse(url).hostname
         if 'basePath' not in swaggerFile:
             swaggerFile['basePath'] = ""
         if 'https' in swaggerFile['schemes']:
@@ -39,62 +42,39 @@ def get_base_url(swaggerFile, url):
         raise Exception("[-] Error: Swagger file is not valid\n" + str(e) + "\nSee https://swagger.io/specification/ for more information")
 
 
-def get_swagger_file(url):
-    try:
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        response = requests.get(url, verify=False)     
-        if response.status_code == 200:
-            if "application/json" in response.headers['Content-Type']:
-                response = response.json()
-            return response
-        else:
-            print("[-] Error: " + str(response.status_code))
-            sys.exit(1)
-    except Exception as e:
-        print(traceback.print_exc())
-        print("[-] Error: " + str(e))
-        sys.exit(1)
+def check_properties(model_name):
+    if "properties" in model_name:
+        return model_name['properties']
+    elif "additionalProperties" in model_name:
+        return model_name['additionalProperties']
+    else:
+        return model_name
 
 
-def get_swagger_file_local(file):
-    try:
-        with open(file, 'r') as stream:
-            if file.split('.')[-1] == "json":
-                return json.load(stream)
-    except Exception as e:
-        print("[-] Error: " + str(e))
-        sys.exit(1)
-
-
-def get_model(swaggerFile, model_name, ref):
+def parse_object(model_name):
     try:
         model = {}
-        swagerModel = ref.split('/')[-1]
-        if model_name in swaggerFile[swagerModel]:
-            if 'properties' in swaggerFile[swagerModel][model_name]:
-                #print(swaggerFile[swagerModel][model_name]['properties'])
-                for key in swaggerFile[swagerModel][model_name]['properties']:
-                    if '$ref' in swaggerFile[swagerModel][model_name]['properties'][key]:
-                        ref = swaggerFile[swagerModel][model_name]['properties'][key]['$ref'].split('/')
-                        refModel = ref[-1]
-                        ref.pop()
-                        ref = '/'.join(ref)
-                        model[key] = get_model(swaggerFile, refModel, ref)
-                    elif 'array' in swaggerFile[swagerModel][model_name]['properties'][key]['type']:
-                        if 'type' in swaggerFile[swagerModel][model_name]['properties'][key]['items']:
-                            model[key] = {"array": swaggerFile[swagerModel][model_name]['properties'][key]['items']['type']}
-                        elif '$ref' in swaggerFile[swagerModel][model_name]['properties'][key]['items']:
-                            ref = swaggerFile[swagerModel][model_name]['properties'][key]['items']['$ref'].split('/')
-                            refModel = ref[-1]
-                            ref.pop()
-                            ref = '/'.join(ref)
-                            model[key] = get_model(swaggerFile, refModel, ref)
-                    else:
-                        model[key] = swaggerFile[swagerModel][model_name]['properties'][key]['type']
+        #print(swaggerFile[swagerModel][model_name]['properties'])
+        for key in model_name:
+            if 'type' in model_name[key]:
+                if 'object' in model_name[key]['type']:
+                    ref = check_properties(model_name[key])
+                    model[key] = parse_object(ref)
+                    if 'type' in model[key]:
+                        if model[key]['type'] == "array":
+                            model[key] = {"array": model[key]['items']}
+                        else:
+                            model[key] = model[key]['type']
+                elif 'array' in model_name[key]['type']:
+                    if 'type' in model_name[key]['items']:
+                        model[key] = {"array": model_name[key]['items']['type']}
+                        if 'object' in model_name[key]['items']['type']:
+                            ref = check_properties(model_name[key]['items'])
+                            model[key]["array"] = parse_object(ref)          
+                else:
+                    model[key] = model_name[key]['type']
             else:
-                #print(swaggerFile[swagerModel][model_name])
-                pass
-
+                model[key] = model_name[key]
         return model
     except ValueError as e:
         raise Exception("[-] Error: Swagger file is not valid\n" + str(e) + "\nSee https://swagger.io/specification/ for more information")
@@ -118,27 +98,18 @@ def get_routes(swaggerFile, url):
                         raw = {}
                         if 'in' in param:
                             raw['in'] = param['in']
-                            if param['in'] == "body":
-                                # Get model
-                                if 'schema' in param:
-                                    if '$ref' in param['schema']:
-                                        ref = param['schema']['$ref']
-                                        raw['model'] = ref.split('/')[-1]
-                                        ref = ref.split('/')
-                                        ref.pop()
-                                        ref = '/'.join(ref)
-                                        model = get_model(swaggerFile, raw['model'], ref)
+                            if param['in'] == "body" and 'schema' in param:
+                                if 'type' in param['schema']:
+                                    if 'object' in param['schema']['type']:
+                                        ref = check_properties(param['schema'])
+                                        model = parse_object(ref)
                                         raw['model'] = model
-                                    elif 'items' in param['schema']:
-                                        if '$ref' in param['schema']['items']:
-                                            ref = param['schema']['items']['$ref']
-                                            raw['model'] = ref.split('/')[-1]
-                                            ref = ref.split('/')
-                                            ref.pop()
-                                            ref = '/'.join(ref)
-                                            model = get_model(swaggerFile, raw['model'], ref)
+                                    elif 'array' in param['schema']['type']:
+                                        if 'object' in param['schema']['items']['type']:
+                                            ref = check_properties(param['schema']['items'])
+                                            model = parse_object(ref)
                                             raw['model'] = model
-                                    if 'type' in param['schema']:
+                                    else:
                                         raw['type'] = param['schema']['type']
                         if 'type' in param:
                             if param['type'] == "array":
@@ -152,14 +123,6 @@ def get_routes(swaggerFile, url):
                             raw['name'] = param['name']
                         if 'required' in param:
                             raw['required'] = param['required']
-                        if '$ref' in param:
-                            ref = param['$ref']
-                            raw['model'] = ref.split('/')[-1]
-                            ref = ref.split('/')
-                            ref.pop()
-                            ref = '/'.join(ref)
-                            model = get_model(swaggerFile, raw['model'], ref)
-                            raw['model'] = model
                         if raw != {}:
                             request_route['params'].append(raw)
                     request[route].append(request_route)
@@ -189,7 +152,24 @@ def get_parameters(swaggerFile, route, url):
         print(traceback.print_exc())
         print("[-] Error: " + str(e))
         sys.exit(1)
-    
+
+
+# transform dict {array: something} and if something is a dict and contains {array: something} transform it 
+def transform_array(array):
+    if 'array' in array:
+        if isinstance(array['array'], dict):
+            array = [transform_array(array['array'])]
+        else:
+            array = [AUTOFILL_VALUES[array['array']]]
+    else:
+        for key in array:
+            if isinstance(array[key], dict):
+                array[key] = transform_array(array[key])
+            elif 'array' in array[key]:
+                array[key] = [AUTOFILL_VALUES[array[key]['array']]]
+            else:
+                array[key] = AUTOFILL_VALUES[array[key]]
+    return array
 
 
 # create request with default value from swagger file
@@ -204,7 +184,7 @@ def create_request(routes):
             for param in routes[route][0]['params']:
                 if 'in' in param:
                     if param['in'] == "path":
-                        url = routes[route][0]['route'].replace("{" + param['name'] + "}", AUTOFILL_VALUES[param['type']])
+                        url = url.replace("{" + param['name'] + "}", AUTOFILL_VALUES[param['type']])
                     elif param['in'] == "query":
                         if '?' in routes[route][0]['route'] or '?' in option:
                             option += "&" + param['name'] + "="
@@ -220,7 +200,9 @@ def create_request(routes):
                         if 'model' in param:
                             json_dict = {}
                             for key in param['model']:
-                                if isinstance(param['model'][key], dict):
+                                if 'array' in param['model'][key]:
+                                    json_dict[key] = transform_array(param['model'][key])
+                                elif isinstance(param['model'][key], dict):
                                     json_dict[key] = replace_param(param['model'][key])
                                 else:
                                     json_dict[key] = AUTOFILL_VALUES[param['model'][key]]
@@ -237,7 +219,7 @@ def create_request(routes):
                                 data = add_data(data, param['name'], AUTOFILL_VALUES[param['type']])
                     elif param['in'] == "header":
                         header[param['name']] = AUTOFILL_VALUES[param['type']]
-
+            print()
         print(url + option)
         print("METHOD = " + routes[route][0]['method'])
         print("data = " + str(data))
@@ -245,7 +227,7 @@ def create_request(routes):
         print("files = " + str(files))
         print()
         Request(url + option, routes[route][0]['method'], data, header, files)
-        #requete = Request(routes[route][0][route], routes[route][0]['method'])
+
 
 def add_data(data, name, value):
     if data != "":
@@ -257,7 +239,10 @@ def add_data(data, name, value):
 
 def replace_param(json_dict):
     if 'array' in json_dict:
-        json_dict = [AUTOFILL_VALUES[json_dict['array']]]
+        if isinstance(json_dict['array'], dict):
+            json_dict = [replace_param(json_dict['array'])]
+        else:
+            json_dict = [AUTOFILL_VALUES[json_dict['array']]]
     else:
         for key in json_dict:
             if isinstance(json_dict[key], dict):
@@ -273,20 +258,15 @@ if __name__ == "__main__":
     try:
         parser = argparse.ArgumentParser()
         parser.add_argument('-u', '--url', help='Swagger URL')
-        parser.add_argument('-f', '--file', help='Swagger file')
         args = parser.parse_args()
 
         if args.url:
-            swaggerFile = get_swagger_file(args.url)
-            url = args.url
-        elif args.file:
-            swaggerFile = get_swagger_file_local(args.file)
-            url = None
+            swaggerFile = ResolvingParser(args.url, backend='openapi-spec-validator').specification
         else:
             print("[-] Error: No URL or file")
             sys.exit(1)
 
-        routes = get_routes(swaggerFile, url)
+        routes = get_routes(swaggerFile, args.url)
         #print(json.dumps(routes, indent=4, sort_keys=True))
         create_request(routes)
     except Exception as e:
