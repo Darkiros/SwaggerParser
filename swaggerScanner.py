@@ -4,11 +4,9 @@ import json
 import sys
 import argparse
 import traceback
-import requests
-import urllib3
 import urllib.parse
 from web import Request
-from prance import ResolvingParser
+from prance import ResolvingParser, ValidationError
 
 AUTOFILL_VALUES = {
     "file": ("pix.gif", b"GIF89a", "image/gif"),
@@ -39,7 +37,7 @@ def get_base_url(swaggerFile, url):
         else:
             return 'http://' + swaggerFile['host'] + swaggerFile['basePath']
     except ValueError as e:
-        raise Exception("[-] Error: Swagger file is not valid\n" + str(e) + "\nSee https://swagger.io/specification/ for more information")
+        print("[-] Error: Swagger file is not valid : " + str(e) + ". See https://swagger.io/specification/ for more information.")
 
 
 def check_properties(model_name):
@@ -54,7 +52,6 @@ def check_properties(model_name):
 def parse_object(model_name):
     try:
         model = {}
-        #print(swaggerFile[swagerModel][model_name]['properties'])
         for key in model_name:
             if 'type' in model_name[key]:
                 if 'object' in model_name[key]['type']:
@@ -80,51 +77,55 @@ def parse_object(model_name):
         raise Exception("[-] Error: Swagger file is not valid\n" + str(e) + "\nSee https://swagger.io/specification/ for more information")
 
 
+def check_params(params):
+    raws = []
+    for param in params:
+        raw = {}
+        if 'in' in param:
+            raw['in'] = param['in']
+            if param['in'] == "body" and 'schema' in param:
+                if 'type' in param['schema']:
+                    if 'object' in param['schema']['type']:
+                        ref = check_properties(param['schema'])
+                        model = parse_object(ref)
+                        raw['model'] = model
+                    elif 'array' in param['schema']['type']:
+                        if 'object' in param['schema']['items']['type']:
+                            ref = check_properties(param['schema']['items'])
+                            model = parse_object(ref)
+                            raw['model'] = model
+                    else:
+                        raw['type'] = param['schema']['type']
+        if 'type' in param:
+            if param['type'] == "array":
+                if 'enum' in param['items']:
+                    raw['type'] = {"enum" : param['items']['enum']}
+                else:
+                    raw['type'] = {"array" : param['items']['type']}
+            else:
+                raw['type'] = param['type']
+        if 'name' in param:
+            raw['name'] = param['name']
+        if 'required' in param:
+            raw['required'] = param['required']
+        if raw != {}:
+            raws.append(raw)
+    return raws
+
+
 def get_routes(swaggerFile, url):
     try:
-        request = {}
-        
+        request = {}  
         base_path = get_base_url(swaggerFile, url)
         for path in swaggerFile['paths']:
             for method in swaggerFile['paths'][path]:
                 route = method.upper() + " " + base_path + path
                 params = get_parameters(swaggerFile, route, url)
                 request[route] = []
-                # get only in and type parameters
                 if params:
                     request_route = {"method": method.upper(), "route": route.replace(method.upper() + ' ', '')}
                     request_route['params'] = []
-                    for param in params:
-                        raw = {}
-                        if 'in' in param:
-                            raw['in'] = param['in']
-                            if param['in'] == "body" and 'schema' in param:
-                                if 'type' in param['schema']:
-                                    if 'object' in param['schema']['type']:
-                                        ref = check_properties(param['schema'])
-                                        model = parse_object(ref)
-                                        raw['model'] = model
-                                    elif 'array' in param['schema']['type']:
-                                        if 'object' in param['schema']['items']['type']:
-                                            ref = check_properties(param['schema']['items'])
-                                            model = parse_object(ref)
-                                            raw['model'] = model
-                                    else:
-                                        raw['type'] = param['schema']['type']
-                        if 'type' in param:
-                            if param['type'] == "array":
-                                if 'enum' in param['items']:
-                                    raw['type'] = {"enum" : param['items']['enum']}
-                                else:
-                                    raw['type'] = {"array" : param['items']['type']}
-                            else:
-                                raw['type'] = param['type']
-                        if 'name' in param:
-                            raw['name'] = param['name']
-                        if 'required' in param:
-                            raw['required'] = param['required']
-                        if raw != {}:
-                            request_route['params'].append(raw)
+                    request_route['params'] += check_params(params)
                     request[route].append(request_route)
                 else:
                     request_route = {"method": method.upper(), "route": route.replace(method.upper() + ' ', '')}
@@ -172,6 +173,45 @@ def transform_array(array):
     return array
 
 
+def transform_query(route, param, option):
+    if '?' in routes[route][0]['route'] or '?' in option:
+        option += "&" + param['name'] + "="
+    else:
+        option += "?" + param['name'] + "="
+    if 'enum' in param['type']:
+        option += param['type']['enum'][0]
+    elif 'array' in param['type']:
+        option += AUTOFILL_VALUES[param['type']['array']]
+    else:
+        option += AUTOFILL_VALUES[param['type']]
+
+
+def transform_body(param):
+    json_dict = {}
+    for key in param['model']:
+        if 'array' in param['model'][key]:
+            json_dict[key] = transform_array(param['model'][key])
+        elif isinstance(param['model'][key], dict):
+            json_dict[key] = replace_param(param['model'][key])
+        else:
+            json_dict[key] = AUTOFILL_VALUES[param['model'][key]]
+    return json.dumps(json_dict)
+
+
+def transform_formData(param, files):
+    data = ""
+    if 'enum' in param['type']:
+        data = add_data(data, param['name'], param['type']['enum'][0])
+    elif 'array' in param['type']:
+        data = add_data(data, param['name'], "[" + AUTOFILL_VALUES[param['type']['array']] + "]")
+    else:
+        if param['type'] == "file":
+            files.append(AUTOFILL_VALUES[param['type']])
+        else:
+            data = add_data(data, param['name'], AUTOFILL_VALUES[param['type']])
+    return data
+
+
 # create request with default value from swagger file
 def create_request(routes):
     for route in routes:
@@ -186,40 +226,13 @@ def create_request(routes):
                     if param['in'] == "path":
                         url = url.replace("{" + param['name'] + "}", AUTOFILL_VALUES[param['type']])
                     elif param['in'] == "query":
-                        if '?' in routes[route][0]['route'] or '?' in option:
-                            option += "&" + param['name'] + "="
-                        else:
-                            option += "?" + param['name'] + "="
-                        if 'enum' in param['type']:
-                            option += param['type']['enum'][0]
-                        elif 'array' in param['type']:
-                            option += AUTOFILL_VALUES[param['type']['array']]
-                        else:
-                            option += AUTOFILL_VALUES[param['type']]
-                    elif param['in'] == "body":
-                        if 'model' in param:
-                            json_dict = {}
-                            for key in param['model']:
-                                if 'array' in param['model'][key]:
-                                    json_dict[key] = transform_array(param['model'][key])
-                                elif isinstance(param['model'][key], dict):
-                                    json_dict[key] = replace_param(param['model'][key])
-                                else:
-                                    json_dict[key] = AUTOFILL_VALUES[param['model'][key]]
-                            data = json.dumps(json_dict)
+                        transform_query(route, param, option)
+                    elif param['in'] == "body" and 'model' in param:
+                        data = transform_body(param)
                     elif param['in'] == "formData":
-                        if 'enum' in param['type']:
-                            data = add_data(data, param['name'], param['type']['enum'][0])
-                        elif 'array' in param['type']:
-                            data = add_data(data, param['name'], "[" + AUTOFILL_VALUES[param['type']['array']] + "]")
-                        else:
-                            if param['type'] == "file":
-                                files.append(AUTOFILL_VALUES[param['type']])
-                            else:
-                                data = add_data(data, param['name'], AUTOFILL_VALUES[param['type']])
+                        data = transform_formData(param, files)
                     elif param['in'] == "header":
                         header[param['name']] = AUTOFILL_VALUES[param['type']]
-            print()
         print(url + option)
         print("METHOD = " + routes[route][0]['method'])
         print("data = " + str(data))
@@ -261,7 +274,13 @@ if __name__ == "__main__":
         args = parser.parse_args()
 
         if args.url:
-            swaggerFile = ResolvingParser(args.url, backend='openapi-spec-validator').specification
+            # check if url is a yaml or json
+            try:
+                swaggerFile = ResolvingParser(args.url, backend='openapi-spec-validator', strict=False).specification
+            except ValidationError as e:
+                print("[-] Error: Swagger file is not valid : " + str(e.args[0]) + ". See https://swagger.io/specification/ for more information.")
+            except AssertionError as e:
+                print("[-] Error: File not found")
         else:
             print("[-] Error: No URL or file")
             sys.exit(1)
@@ -270,6 +289,6 @@ if __name__ == "__main__":
         #print(json.dumps(routes, indent=4, sort_keys=True))
         create_request(routes)
     except Exception as e:
-        print(traceback.print_exc())
-        print("[-] Error: " + str(e))
+        #print(traceback.print_exc())
+        #print("[-] Error: " + str(e))
         sys.exit(1)
